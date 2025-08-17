@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"time"
 
 	"cloud.google.com/go/logging"
 	"go.uber.org/zap"
@@ -221,6 +222,11 @@ func Error(err error) Field {
 	return Field{Key: "error", Value: err}
 }
 
+// Duration creates a field with a time.Duration value.
+func Duration(key string, value time.Duration) Field {
+	return Field{Key: key, Value: value}
+}
+
 // toZapLevel converts the package's Level to zapcore.Level.
 func toZapLevel(lvl Level) zapcore.Level {
 	switch lvl {
@@ -252,6 +258,8 @@ func toZapFields(fields []Field) []zapcore.Field {
 			zapFields[i] = zap.Float64(f.Key, v)
 		case error:
 			zapFields[i] = zap.Error(v)
+		case time.Duration:
+			zapFields[i] = zap.Duration(f.Key, v)
 		default:
 			zapFields[i] = zap.Any(f.Key, v)
 		}
