@@ -40,7 +40,7 @@ func (c *mockGCPZapCore) Enabled(lvl zapcore.Level) bool {
 }
 
 func (c *mockGCPZapCore) With(fields []zapcore.Field) zapcore.Core {
-	return c
+	return c // Simplified for testing; no field persistence needed
 }
 
 func (c *mockGCPZapCore) Check(ent zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
@@ -107,6 +107,7 @@ func TestNewLogger(t *testing.T) {
 			name: "Multiple providers",
 			options: []LoggerOption{
 				WithStdOutProvider(ConsoleEncoder),
+				WithWriterProvider(&bytes.Buffer{}, JSONEncoder),
 				WithFileProvider(filepath.Join(t.TempDir(), "test.log"), 1, 2, 3, false),
 				WithLevel(WarnLevel),
 			},
@@ -219,8 +220,12 @@ func TestStructuredFields(t *testing.T) {
 			name:  "Float64",
 			field: Float64("value", 3.14),
 			check: func(t *testing.T, fields []zapcore.Field) {
-				if len(fields) != 1 || fields[0].Key != "value" || fields[0].Type != zapcore.Float64Type || fields[0].Integer != int64(3.14*1e9) {
+				if len(fields) != 1 || fields[0].Key != "value" || fields[0].Type != zapcore.Float64Type {
 					t.Errorf("Expected Float64 field {value: 3.14}, got %v", fields)
+				}
+				// Zap stores Float64 as int64 (scaled by 1e9)
+				if float64(fields[0].Integer)/1e9 != 3.14 {
+					t.Errorf("Expected Float64 value 3.14, got %v", float64(fields[0].Integer)/1e9)
 				}
 			},
 		},
@@ -261,7 +266,6 @@ func TestStructuredFields(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create a new observer and buffer for each test case
 			var buf bytes.Buffer
 			observerCore, logs := observer.New(zapcore.DebugLevel)
 			encoderCfg := zap.NewProductionEncoderConfig()
@@ -286,17 +290,12 @@ func TestGCPProviderMock(t *testing.T) {
 	// Mock GCP provider
 	gcpMock := &mockGCPProvider{projectID: "test-project", logName: "test-log"}
 
-	// Override WithGCPProvider for this test
-	origWithGCPProvider := WithGCPProvider
-	defer func() { WithGCPProvider = origWithGCPProvider }()
-	WithGCPProvider = func(projectID, logName string) LoggerOption {
-		return func(cfg *loggerConfig) {
-			cfg.providers = append(cfg.providers, gcpMock)
-		}
-	}
-
 	log, err := NewLogger(
-		WithGCPProvider("test-project", "test-log"),
+		func() LoggerOption {
+			return func(cfg *loggerConfig) {
+				cfg.providers = append(cfg.providers, gcpMock)
+			}
+		}(),
 		WithLevel(InfoLevel),
 	)
 	if err != nil {
