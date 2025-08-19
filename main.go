@@ -3,6 +3,7 @@ package golog
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"time"
 
@@ -23,6 +24,14 @@ const (
 	FatalLevel
 )
 
+// EncoderType represents the type of encoder for log output.
+type EncoderType string
+
+const (
+	JSONEncoder    EncoderType = "json"
+	ConsoleEncoder EncoderType = "console"
+)
+
 // provider is an internal interface for logging providers.
 type provider interface {
 	newCore(level zapcore.Level) (zapcore.Core, error)
@@ -30,19 +39,41 @@ type provider interface {
 
 // stdOutProvider is a provider for logging to standard output.
 type stdOutProvider struct {
-	encoderType string // "json" or "console"
+	encoderType EncoderType
 }
 
 // newCore implements the provider interface for stdOutProvider.
 func (p stdOutProvider) newCore(level zapcore.Level) (zapcore.Core, error) {
 	encoderCfg := zap.NewProductionEncoderConfig()
 	var encoder zapcore.Encoder
-	if p.encoderType == "console" {
+	switch p.encoderType {
+	case ConsoleEncoder:
 		encoder = zapcore.NewConsoleEncoder(encoderCfg)
-	} else {
+	default:
 		encoder = zapcore.NewJSONEncoder(encoderCfg)
 	}
 	syncer := zapcore.AddSync(os.Stdout)
+	core := zapcore.NewCore(encoder, syncer, level)
+	return core, nil
+}
+
+// writerProvider is a provider for logging to a custom io.Writer.
+type writerProvider struct {
+	writer      io.Writer
+	encoderType EncoderType
+}
+
+// newCore implements the provider interface for writerProvider.
+func (p writerProvider) newCore(level zapcore.Level) (zapcore.Core, error) {
+	encoderCfg := zap.NewProductionEncoderConfig()
+	var encoder zapcore.Encoder
+	switch p.encoderType {
+	case ConsoleEncoder:
+		encoder = zapcore.NewConsoleEncoder(encoderCfg)
+	default:
+		encoder = zapcore.NewJSONEncoder(encoderCfg)
+	}
+	syncer := zapcore.AddSync(p.writer)
 	core := zapcore.NewCore(encoder, syncer, level)
 	return core, nil
 }
@@ -101,9 +132,16 @@ type loggerConfig struct {
 }
 
 // WithStdOutProvider adds a standard output provider to the logger configuration.
-func WithStdOutProvider(encoderType string) LoggerOption {
+func WithStdOutProvider(encoderType EncoderType) LoggerOption {
 	return func(cfg *loggerConfig) {
 		cfg.providers = append(cfg.providers, stdOutProvider{encoderType: encoderType})
+	}
+}
+
+// WithWriterProvider adds a custom writer provider to the logger configuration.
+func WithWriterProvider(writer io.Writer, encoderType EncoderType) LoggerOption {
+	return func(cfg *loggerConfig) {
+		cfg.providers = append(cfg.providers, writerProvider{writer: writer, encoderType: encoderType})
 	}
 }
 
