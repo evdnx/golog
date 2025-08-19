@@ -227,6 +227,11 @@ func Duration(key string, value time.Duration) Field {
 	return Field{Key: key, Value: value}
 }
 
+// Any creates a field with an arbitrary value.
+func Any(key string, value interface{}) Field {
+	return Field{Key: key, Value: value}
+}
+
 // toZapLevel converts the package's Level to zapcore.Level.
 func toZapLevel(lvl Level) zapcore.Level {
 	switch lvl {
