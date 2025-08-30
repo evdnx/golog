@@ -1,33 +1,22 @@
-# Go Logger Package
+# Go Logger Package  
+A robust, extensible logging package for Go built on top of Uber’s **Zap** logger.  
+It supports multiple logging providers (standard output, custom writer, Google Cloud Logging, and file logging with rotation) via a simple, dependency‑free public API while keeping third‑party packages hidden from the consumer.
 
-A robust, extensible logging package for Go, built on top of Uber's Zap logger. It supports multiple logging providers (standard output, custom writer, Google Cloud Logging, and file logging with rotation) with a simple, dependency-free API for users. The package is designed to be flexible, allowing for easy addition of new providers in the future while hiding third-party dependencies from the end user.
+## Features  
+- **Multiple Providers** – Log to stdout, any `io.Writer`, Google Cloud Logging, or a rotating file (or any combination thereof).  
+- **Structured Logging** – Key‑value fields without exposing Zap internals.  
+- **Custom Log Levels** – `Debug`, `Info`, `Warn`, `Error`, `Fatal`.  
+- **Log Rotation** – Size‑based rotation with configurable backups, age, and optional gzip compression.  
+- **Zero‑Dependency API** – Users import only `github.com/evdnx/golog`; the package internally manages Zap, GCP, and Lumberjack.  
+- **Extensible Design** – New providers can be added by implementing the internal `provider` interface.  
+- **High Performance** – Leverages Zap’s low‑overhead core.
 
-## Features
-
-- **Multiple Providers**: Log to standard output, custom writer (e.g., buffer), Google Cloud Logging, file with rotation, or any combination of these.
-- **Structured Logging**: Supports key-value fields for structured logging without exposing Zap internals.
-- **Customizable Log Levels**: Choose from `Debug`, `Info`, `Warn`, `Error`, or `Fatal` levels.
-- **Log Rotation**: File provider supports log rotation with configurable size, backup count, age, and compression.
-- **Dependency-Free API**: No need to import third-party packages like `go.uber.org/zap`, `cloud.google.com/go/logging`, or `gopkg.in/natefinch/lumberjack.v2`.
-- **Extensible Design**: Easily add new logging providers internally without changing the public API.
-- **High Performance**: Leverages Zap's performance optimizations under the hood.
-
-## Installation
-
-To use this package, add it to your Go project:
-
+## Installation  
 ```bash
-go get github.com/evdnx/golog
+go get github.com/evdnx/golog  
 ```
 
-Replace `github.com/evdnx/golog` with the actual repository path where the package is hosted.
-
-## Usage
-
-The package provides a simple API for creating and using a logger. Below is an example of how to set up and use the logger with a custom writer, Google Cloud Logging, and file providers with rotation.
-
-### Example
-
+## Getting Started  
 ```go
 package main
 
@@ -39,153 +28,156 @@ import (
 	"github.com/evdnx/golog"
 )
 
-type Result struct {
-	Value  interface{}
-	Status string
-}
-
 func main() {
-	// Set up a buffer to capture log output
 	var buf bytes.Buffer
 
-	// Create a logger with writer, GCP, and file providers
-	log, err := golog.NewLogger(
+	// Create a logger that writes to a buffer, GCP, and a rotating file.
+	logger, err := golog.NewLogger(
 		golog.WithWriterProvider(&buf, golog.ConsoleEncoder),
 		golog.WithGCPProvider("my-project-id", "my-log-name"),
-		golog.WithFileProvider("/var/log/myapp.log", 10, 3, 7, true), // 10MB, 3 backups, 7 days, compress
+		golog.WithFileProvider("/var/log/myapp.log", 10, 3, 7, true), // 10 MiB, 3 backups, 7 days, gzip
 		golog.WithLevel(golog.DebugLevel),
 	)
 	if err != nil {
 		panic(err)
 	}
-	defer log.Sync()
+	defer logger.Close() // flushes and releases resources
 
-	// Log application start
-	log.Info("Application started", golog.String("app", "my-app"), golog.Int("version", 1))
-
-	// Simulate an operation with timing
-	start := time.Now()
-	time.Sleep(150 * time.Millisecond) // Simulate work
-	duration := time.Since(start)
-
-	// Log operation with duration
-	log.Info("Operation completed",
-		golog.String("operation", "example_task"),
-		golog.Duration("elapsed", duration),
+	logger.Info("Application started",
+		golog.String("app", "my-app"),
+		golog.Int("version", 1),
 	)
 
-	// Log a result with Any
-	result := Result{
-		Value:  map[string]int{"count": 42},
-		Status: "Ok",
+	// Example of logging a timed operation
+	start := time.Now()
+	time.Sleep(150 * time.Millisecond) // simulate work
+	logger.Info("Operation completed",
+		golog.String("operation", "example_task"),
+		golog.Duration("elapsed", time.Since(start)),
+	)
+
+	// Log a structured result
+	type Result struct {
+		Value  interface{}
+		Status string
 	}
-	log.Info("Result", golog.String("status", result.Status), golog.Any("value", result.Value))
+	res := Result{
+		Value:  map[string]int{"count": 42},
+		Status: "OK",
+	}
+	logger.Info("Result",
+		golog.String("status", res.Status),
+		golog.Any("value", res.Value),
+	)
 
 	// Log an error
-	log.Error("Something went wrong", golog.Error(errors.New("example error")))
-
-	// Log debug info
-	log.Debug("Debugging info", golog.Float64("value", 42.5))
-
-	// Print buffer contents (for demonstration)
-	// fmt.Println(buf.String())
+	logger.Error("Something went wrong", golog.Error(errors.New("example error")))
 }
 ```
 
-### Configuration Options
+## Configuration Options  
 
-- **`WithStdOutProvider(encoderType EncoderType)`**: Configures logging to standard output. The `encoderType` can be `logger.JSONEncoder` for JSON output or `logger.ConsoleEncoder` for human-readable output.
-- **`WithWriterProvider(writer io.Writer, encoderType EncoderType)`**: Configures logging to a custom `io.Writer` (e.g., a buffer or file). The `encoderType` can be `logger.JSONEncoder` or `logger.ConsoleEncoder`.
-- **`WithGCPProvider(projectID, logName string)`**: Configures logging to Google Cloud Logging with the specified GCP project ID and log name.
-- **`WithFileProvider(filename string, maxSize, maxBackups, maxAge int, compress bool)`**: Configures logging to a file with rotation. Parameters include:
-  - `filename`: Path to the log file (e.g., `/var/log/myapp.log`).
-  - `maxSize`: Maximum file size in megabytes before rotation.
-  - `maxBackups`: Maximum number of old log files to retain.
-  - `maxAge`: Maximum number of days to retain old log files.
-  - `compress`: Whether to compress rotated log files using gzip.
-- **`WithLevel(level Level)`**: Sets the minimum log level (`DebugLevel`, `InfoLevel`, `WarnLevel`, `ErrorLevel`, or `FatalLevel`).
+| Option                                 | Description                                                                                                    |
+|----------------------------------------|----------------------------------------------------------------------------------------------------------------|
+| `WithStdOutProvider(encoder EncoderType)` | Sends logs to `os.Stdout`. `encoder` can be `golog.JSONEncoder` (machine‑readable) or `golog.ConsoleEncoder` (human‑readable). |
+| `WithWriterProvider(w io.Writer, encoder EncoderType)` | Sends logs to any `io.Writer` (e.g., a `bytes.Buffer`).                                                       |
+| `WithGCPProvider(projectID, logName string)` | Sends logs to Google Cloud Logging under the given project and log name.                                        |
+| `WithFileProvider(path string, maxSize, maxBackups, maxAge int, compress bool)` | Writes logs to a file with rotation. See **Log Rotation** below for parameter meanings.                         |
+| `WithLevel(l Level)`                   | Sets the minimum level that will be emitted (`DebugLevel` … `FatalLevel`).                                      |
 
-### Logging Methods
+### Log Rotation Details  
 
-The `Logger` type provides the following methods:
+| Parameter      | Meaning                                                                                     |
+|----------------|---------------------------------------------------------------------------------------------|
+| `maxSize` (MiB) | Rotate when the file exceeds this size.                                                     |
+| `maxBackups`   | Maximum number of rotated files to keep (e.g., `myapp.log.1`, `myapp.log.2`, …).          |
+| `maxAge` (days) | Delete rotated files older than this many days.                                            |
+| `compress`     | If `true`, rotated files are gzipped (`*.gz`).                                             |
 
-- `Debug(msg string, fields ...Field)`: Logs a message at the Debug level.
-- `Info(msg string, fields ...Field)`: Logs a message at the Info level.
-- `Warn(msg string, fields ...Field)`: Logs a message at the Warn level.
-- `Error(msg string, fields ...Field)`: Logs a message at the Error level.
-- `Fatal(msg string, fields ...Field)`: Logs a message at the Fatal level and exits the program.
-- `Sync()`: Flushes any buffered log entries.
+> **Tip:** The underlying implementation uses **lumberjack**; all values are passed straight through, so the semantics match the lumberjack documentation.
 
-### Structured Logging Fields
+## Logging Methods
+```go
+Debug(msg string, fields ...Field)
+Info(msg string, fields ...Field)
+Warn(msg string, fields ...Field)
+Error(msg string, fields ...Field)
+Fatal(msg string, fields ...Field) // calls os.Exit(1) after logging
+Sync() error // flushes buffered entries
+Close() error // Sync + provider cleanup (recommended)
+```
 
-Use the following helper functions to create structured logging fields:
 
-- `String(key, value string)`: Adds a string field.
-- `Int(key string, value int)`: Adds an integer field.
-- `Float64(key string, value float64)`: Adds a float64 field.
-- `Error(err error)`: Adds an error field.
-- `Duration(key string, value time.Duration)`: Adds a duration field (e.g., for logging elapsed time).
-- `Any(key string, value interface{})`: Adds a field with an arbitrary value (e.g., structs, maps, or slices).
+## Structured Field Helpers  
 
-### Log Rotation
+| Helper   | Signature                              | Example                                   |
+|----------|----------------------------------------|-------------------------------------------|
+| `String` | `String(key, value string) Field`      | `golog.String("user", "alice")`          |
+| `Int`    | `Int(key string, value int) Field`    | `golog.Int("attempts", 3)`               |
+| `Float64`| `Float64(key string, value float64) Field` | `golog.Float64("ratio", 0.75)`          |
+| `Error`  | `Error(err error) Field`               | `golog.Error(err)`                       |
+| `Duration`| `Duration(key string, d time.Duration) Field` | `golog.Duration("latency", 120*time.Millisecond)` |
+| `Any`    | `Any(key string, v interface{}) Field` | `golog.Any("payload", myStruct)`         |
 
-The file provider supports log rotation using the following settings:
-- **MaxSize**: Rotates the log file when it exceeds the specified size (in megabytes).
-- **MaxBackups**: Limits the number of old log files retained.
-- **MaxAge**: Deletes old log files after the specified number of days.
-- **Compress**: Compresses rotated log files using gzip to save disk space.
-
-For example, `WithFileProvider("/var/log/myapp.log", 10, 3, 7, true)` configures the logger to:
-- Write logs to `/var/log/myapp.log`.
-- Rotate when the file exceeds 10MB.
-- Keep up to 3 backup files (e.g., `myapp.log.1`, `myapp.log.2`, etc.).
-- Delete backups older than 7 days.
-- Compress rotated files.
-
-## Running Tests
-
-The package includes a comprehensive test suite to verify its functionality. To run the tests, navigate to the package directory and execute:
-
+## Running the Test Suite  
 ```bash
 go test -v ./...
 ```
 
-The tests cover:
-- Logger creation with different providers (stdout, writer, file, GCP).
-- Logging at various levels (`Debug`, `Info`, `Warn`, `Error`).
-- Structured logging fields (`String`, `Int`, `Float64`, `Error`, `Duration`, `Any`).
-- Configuration options and error handling.
+The suite covers:
 
-Note: Tests for the GCP provider use a mock to avoid real API calls, so no GCP credentials are required.
+- Creation of a logger with each provider (stdout, writer, GCP mock, file).  
+- Emission at every log level.  
+- Correct encoding of all field helpers.  
+- Validation of rotation parameters and graceful cleanup.  
 
-## Releases
+> **Note:** The GCP tests use a mock client, so no credentials are required.
 
-This project uses Semantic Versioning (SemVer) with tags in the format `vX.Y.Z` (e.g., `v1.0.0`). Pre-release versions may include suffixes like `-alpha.1`, `-beta.2`, or `-rc.1`. Tags are annotated with release notes for clarity. For example, `v0.0.0` may be used for early prototypes, while `v1.0.0` indicates a stable release.
+## Release Policy  
 
-## Design Principles
+We follow **Semantic Versioning** (`MAJOR.MINOR.PATCH`). Pre‑releases use suffixes such as `-alpha.1`, `-beta.2`, or `-rc.1`. Tag examples:
 
-- **Encapsulation**: Hides third-party dependencies (`go.uber.org/zap`, `cloud.google.com/go/logging`, `gopkg.in/natefinch/lumberjack.v2`) to simplify the user experience.
-- **Extensibility**: Uses an internal provider interface to allow easy addition of new logging backends without modifying the public API.
-- **Simplicity**: Provides a clean, minimal API focused on common logging use cases.
-- **Performance**: Builds on Zap's high-performance logging core for efficient logging.
+- `v0.0.0` – early prototype.  
+- `v1.0.0` – first stable release.
 
-## Adding New Providers
+Release notes are attached to each tag.
 
-To add a new logging provider (e.g., for a different cloud service or output format), implement the internal `provider` interface within the package. The interface requires a `newCore(level zapcore.Level) (zapcore.Core, error)` method. Then, add a new `With<ProviderName>Provider` function to the public API to allow users to configure it.
+## Extending the Package  
 
-## Dependencies
+To add a new provider (e.g., a custom cloud service):
 
-The package internally depends on:
-- `go.uber.org/zap`: For high-performance logging.
-- `cloud.google.com/go/logging`: For Google Cloud Logging integration.
-- `gopkg.in/natefinch/lumberjack.v2`: For log rotation in the file provider.
+1. Implement the internal `provider` interface:
 
-Users do not need to import these dependencies directly, as the package encapsulates all functionality.
+    ```go
+    type myProvider struct { /* config fields */ }
+    func (p *myProvider) newCore(level zapcore.Level) (zapcore.Core, error) { … }
+    func (p *myProvider) close() error { … } // optional
+    ```
 
-## License
+2. Export a functional option:
 
-This package is licensed under the MIT License. See the `LICENSE` file for details.
+    ```go
+    func WithMyProvider(arg1 string, arg2 int) LoggerOption {
+        return func(cfg *loggerConfig) {
+            cfg.providers = append(cfg.providers, &myProvider{…})
+        }
+    }
+    ```
 
-## Contributing
+3. Add documentation and, optionally, tests.
 
-Contributions are welcome! Please submit a pull request or open an issue on the repository to suggest improvements or report bugs.
+## License  
+
+MIT-0 (no attrib) – see the `LICENSE` file.
+
+## Contributing  
+
+Contributions are welcome! Please follow these steps:
+
+1. Fork the repository.  
+2. Create a feature branch (`git checkout -b feat/my‑feature`).  
+3. Write code **and** accompanying tests.  
+4. Run `go vet ./...` and `go test -v ./...` locally.  
+5. Open a Pull Request describing the change and linking any relevant issues.
+
+Thank you for helping make this logger better! 🎉
