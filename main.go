@@ -3,6 +3,7 @@ package golog
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"time"
@@ -13,7 +14,10 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
-// Level represents the logging level.
+/* -------------------------------------------------------------------------- */
+/*                               Log Levels                                   */
+/* -------------------------------------------------------------------------- */
+
 type Level int
 
 const (
@@ -24,7 +28,10 @@ const (
 	FatalLevel
 )
 
-// EncoderType represents the type of encoder for log output.
+/* -------------------------------------------------------------------------- */
+/*                              Encoder Types                                  */
+/* -------------------------------------------------------------------------- */
+
 type EncoderType string
 
 const (
@@ -32,130 +39,206 @@ const (
 	ConsoleEncoder EncoderType = "console"
 )
 
-// provider is an internal interface for logging providers.
+/* -------------------------------------------------------------------------- */
+/*                         Provider Interface & Closers                        */
+/* -------------------------------------------------------------------------- */
+
+// provider is the internal abstraction each output target implements.
 type provider interface {
 	newCore(level zapcore.Level) (zapcore.Core, error)
+	// close is optional – only providers that allocate external resources need it.
+	close() error
 }
 
-// stdOutProvider is a provider for logging to standard output.
+/* -------------------------------------------------------------------------- */
+/*                           StdOut Provider                                   */
+/* -------------------------------------------------------------------------- */
+
 type stdOutProvider struct {
 	encoderType EncoderType
 }
 
-// newCore implements the provider interface for stdOutProvider.
 func (p stdOutProvider) newCore(level zapcore.Level) (zapcore.Core, error) {
-	encoderCfg := zap.NewProductionEncoderConfig()
-	var encoder zapcore.Encoder
-	switch p.encoderType {
-	case ConsoleEncoder:
-		encoder = zapcore.NewConsoleEncoder(encoderCfg)
-	default:
-		encoder = zapcore.NewJSONEncoder(encoderCfg)
+	enc, err := buildEncoder(p.encoderType)
+	if err != nil {
+		return nil, err
 	}
 	syncer := zapcore.AddSync(os.Stdout)
-	core := zapcore.NewCore(encoder, syncer, level)
-	return core, nil
+	return zapcore.NewCore(enc, syncer, level), nil
 }
+func (p stdOutProvider) close() error { return nil }
 
-// writerProvider is a provider for logging to a custom io.Writer.
+/* -------------------------------------------------------------------------- */
+/*                           Writer Provider                                    */
+/* -------------------------------------------------------------------------- */
+
 type writerProvider struct {
 	writer      io.Writer
 	encoderType EncoderType
 }
 
-// newCore implements the provider interface for writerProvider.
 func (p writerProvider) newCore(level zapcore.Level) (zapcore.Core, error) {
-	encoderCfg := zap.NewProductionEncoderConfig()
-	var encoder zapcore.Encoder
-	switch p.encoderType {
-	case ConsoleEncoder:
-		encoder = zapcore.NewConsoleEncoder(encoderCfg)
-	default:
-		encoder = zapcore.NewJSONEncoder(encoderCfg)
-	}
-	syncer := zapcore.AddSync(p.writer)
-	core := zapcore.NewCore(encoder, syncer, level)
-	return core, nil
-}
-
-// gcpProvider is a provider for logging to Google Cloud Logging.
-type gcpProvider struct {
-	projectID string
-	logName   string
-}
-
-// newCore implements the provider interface for gcpProvider.
-func (p gcpProvider) newCore(level zapcore.Level) (zapcore.Core, error) {
-	ctx := context.Background()
-	client, err := logging.NewClient(ctx, p.projectID)
+	enc, err := buildEncoder(p.encoderType)
 	if err != nil {
 		return nil, err
 	}
-	lg := client.Logger(p.logName)
+	syncer := zapcore.AddSync(p.writer)
+	return zapcore.NewCore(enc, syncer, level), nil
+}
+func (p writerProvider) close() error { return nil }
+
+/* -------------------------------------------------------------------------- */
+/*                            GCP Provider                                      */
+/* -------------------------------------------------------------------------- */
+
+type gcpProvider struct {
+	projectID string
+	logName   string
+
+	// internal fields populated during newCore
+	client *logging.Client
+	logger *logging.Logger
+}
+
+func (p *gcpProvider) newCore(level zapcore.Level) (zapcore.Core, error) {
+	ctx := context.Background()
+	client, err := logging.NewClient(ctx, p.projectID)
+	if err != nil {
+		return nil, fmt.Errorf("gcpProvider: failed to create client: %w", err)
+	}
+	p.client = client
+	p.logger = client.Logger(p.logName)
+
 	return &gcpZapCore{
-		logger: lg,
+		logger: p.logger,
 		level:  level,
 		fields: make(map[string]interface{}),
 	}, nil
 }
-
-// fileProvider is a provider for logging to a file with rotation.
-type fileProvider struct {
-	filename   string
-	maxSize    int // in megabytes
-	maxBackups int
-	maxAge     int // in days
-	compress   bool
+func (p *gcpProvider) close() error {
+	if p.client != nil {
+		// Flush pending entries before closing.
+		if err := p.client.Close(); err != nil {
+			return fmt.Errorf("gcpProvider: error closing client: %w", err)
+		}
+	}
+	return nil
 }
 
-// newCore implements the provider interface for fileProvider.
-func (p fileProvider) newCore(level zapcore.Level) (zapcore.Core, error) {
-	encoderCfg := zap.NewProductionEncoderConfig()
-	encoder := zapcore.NewJSONEncoder(encoderCfg)
-	syncer := zapcore.AddSync(&lumberjack.Logger{
+/*
+	--------------------------------------------------------------
+	  fileProvider – uses pointer receivers so that the
+	  lumberjack logger assigned in newCore is kept on the same
+	  instance that will later be closed.
+
+--------------------------------------------------------------
+*/
+type fileProvider struct {
+	filename   string
+	maxSize    int // MB
+	maxBackups int
+	maxAge     int // days
+	compress   bool
+
+	// Holds the lumberjack logger for later shutdown.
+	lumberjackLogger *lumberjack.Logger
+}
+
+/*
+	--------------------------------------------------------------
+	  newCore creates a zapcore.Core that writes JSON‑encoded logs
+	  to a rotating file.  It also stores the underlying
+	  lumberjack.Logger on the same *fileProvider* instance so that
+	  Close() can flush and release the file.
+
+--------------------------------------------------------------
+*/
+func (p *fileProvider) newCore(level zapcore.Level) (zapcore.Core, error) {
+	// Validate rotation parameters – negative values are nonsensical.
+	if p.maxSize < 0 || p.maxBackups < 0 || p.maxAge < 0 {
+		return nil, errors.New("fileProvider: rotation parameters must be non‑negative")
+	}
+	enc, err := buildEncoder(JSONEncoder) // file logs are always JSON
+	if err != nil {
+		return nil, err
+	}
+	lj := &lumberjack.Logger{
 		Filename:   p.filename,
 		MaxSize:    p.maxSize,
 		MaxBackups: p.maxBackups,
 		MaxAge:     p.maxAge,
 		Compress:   p.compress,
-	})
-	core := zapcore.NewCore(encoder, syncer, level)
-	return core, nil
+	}
+	// Save the logger for later cleanup.
+	p.lumberjackLogger = lj
+
+	syncer := zapcore.AddSync(lj)
+	return zapcore.NewCore(enc, syncer, level), nil
 }
 
-// LoggerOption defines a functional option for configuring the logger.
+/*
+	--------------------------------------------------------------
+	  close shuts down the lumberjack logger (if it was created),
+	  ensuring the file descriptor is released before the temp
+	  directory is removed in tests.
+
+--------------------------------------------------------------
+*/
+func (p *fileProvider) close() error {
+	if p.lumberjackLogger != nil {
+		return p.lumberjackLogger.Close()
+	}
+	return nil
+}
+
+/* -------------------------------------------------------------------------- */
+/*                     Functional Options & Config Struct                      */
+/* -------------------------------------------------------------------------- */
+
 type LoggerOption func(*loggerConfig)
 
 type loggerConfig struct {
 	providers []provider
 	level     Level
+	// closers collects any provider that needs explicit shutdown.
+	closers []provider
 }
 
-// WithStdOutProvider adds a standard output provider to the logger configuration.
+// WithStdOutProvider adds a stdout destination.
 func WithStdOutProvider(encoderType EncoderType) LoggerOption {
 	return func(cfg *loggerConfig) {
 		cfg.providers = append(cfg.providers, stdOutProvider{encoderType: encoderType})
 	}
 }
 
-// WithWriterProvider adds a custom writer provider to the logger configuration.
+// WithWriterProvider adds a custom io.Writer destination.
 func WithWriterProvider(writer io.Writer, encoderType EncoderType) LoggerOption {
 	return func(cfg *loggerConfig) {
 		cfg.providers = append(cfg.providers, writerProvider{writer: writer, encoderType: encoderType})
 	}
 }
 
-// WithGCPProvider adds a Google Cloud Logging provider to the logger configuration.
+// WithGCPProvider adds Google Cloud Logging as a destination.
 func WithGCPProvider(projectID, logName string) LoggerOption {
 	return func(cfg *loggerConfig) {
-		cfg.providers = append(cfg.providers, gcpProvider{projectID: projectID, logName: logName})
+		cfg.providers = append(cfg.providers, &gcpProvider{projectID: projectID, logName: logName})
 	}
 }
 
-// WithFileProvider adds a file provider with log rotation to the logger configuration.
+/*
+	--------------------------------------------------------------
+	  WithFileProvider – registers a *fileProvider* (pointer) so the
+	  instance created here is the one whose internal lumberjack logger
+	  can later be closed.  Using a pointer ensures that the state
+	  mutated in newCore (the stored *lumberjack.Logger*) is retained.
+
+--------------------------------------------------------------
+*/
 func WithFileProvider(filename string, maxSize, maxBackups, maxAge int, compress bool) LoggerOption {
 	return func(cfg *loggerConfig) {
-		cfg.providers = append(cfg.providers, fileProvider{
+		// Store a pointer so the provider’s internal fields (e.g. the
+		// lumberjack logger) survive beyond the newCore call.
+		cfg.providers = append(cfg.providers, &fileProvider{
 			filename:   filename,
 			maxSize:    maxSize,
 			maxBackups: maxBackups,
@@ -165,130 +248,117 @@ func WithFileProvider(filename string, maxSize, maxBackups, maxAge int, compress
 	}
 }
 
-// WithLevel sets the log level for the logger.
+// WithLevel overrides the default log level (Info).
 func WithLevel(level Level) LoggerOption {
 	return func(cfg *loggerConfig) {
 		cfg.level = level
 	}
 }
 
-// Logger is the main logging interface provided to users.
+/* -------------------------------------------------------------------------- */
+/*                                 Logger API                                   */
+/* -------------------------------------------------------------------------- */
+
 type Logger struct {
 	zapLogger *zap.Logger
+	// keep a reference to the config so we can close providers later.
+	closers []provider
 }
 
-// NewLogger creates a new Logger based on the provided functional options.
+// NewLogger builds a logger from the supplied functional options.
 func NewLogger(options ...LoggerOption) (*Logger, error) {
 	cfg := &loggerConfig{
 		providers: []provider{},
-		level:     InfoLevel, // Default level
+		level:     InfoLevel, // default
 	}
 
 	for _, opt := range options {
 		opt(cfg)
 	}
 
+	if len(cfg.providers) == 0 {
+		return nil, errors.New("no providers specified")
+	}
+
 	var cores []zapcore.Core
 	for _, p := range cfg.providers {
 		core, err := p.newCore(toZapLevel(cfg.level))
 		if err != nil {
-			return nil, err
+			// Attempt to close any providers already initialised.
+			_ = closeProviders(cfg.providers)
+			return nil, fmt.Errorf("failed to initialise provider: %w", err)
 		}
 		cores = append(cores, core)
+		// Keep track of providers that implement close().
+		cfg.closers = append(cfg.closers, p)
 	}
-	if len(cores) == 0 {
-		return nil, errors.New("no providers specified")
-	}
+
 	teeCore := zapcore.NewTee(cores...)
-	zapLogger := zap.New(teeCore)
-	return &Logger{zapLogger: zapLogger}, nil
+	zapLogger := zap.New(teeCore, zap.AddCaller()) // always capture caller info
+	return &Logger{zapLogger: zapLogger, closers: cfg.closers}, nil
 }
 
-// Debug logs a message at Debug level with optional fields.
+// Close flushes the zap logger and shuts down any provider resources.
+func (l *Logger) Close() error {
+	var firstErr error
+	// zap.Logger.Sync() never returns zap.ErrClosed, so we just propagate any error it gives.
+	if err := l.zapLogger.Sync(); err != nil {
+		firstErr = fmt.Errorf("zap sync error: %w", err)
+	}
+	if err := closeProviders(l.closers); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
+}
+
+// Sync is retained for backward compatibility – it simply forwards to zap.Sync().
+func (l *Logger) Sync() error { return l.zapLogger.Sync() }
+
+// Debug logs at Debug level.
 func (l *Logger) Debug(msg string, fields ...Field) {
 	l.zapLogger.Debug(msg, toZapFields(fields)...)
 }
 
-// Info logs a message at Info level with optional fields.
+// Info logs at Info level.
 func (l *Logger) Info(msg string, fields ...Field) {
 	l.zapLogger.Info(msg, toZapFields(fields)...)
 }
 
-// Warn logs a message at Warn level with optional fields.
+// Warn logs at Warn level.
 func (l *Logger) Warn(msg string, fields ...Field) {
 	l.zapLogger.Warn(msg, toZapFields(fields)...)
 }
 
-// Error logs a message at Error level with optional fields.
+// Error logs at Error level.
 func (l *Logger) Error(msg string, fields ...Field) {
 	l.zapLogger.Error(msg, toZapFields(fields)...)
 }
 
-// Fatal logs a message at Fatal level with optional fields and exits.
+// Fatal logs at Fatal level and then exits the process.
 func (l *Logger) Fatal(msg string, fields ...Field) {
 	l.zapLogger.Fatal(msg, toZapFields(fields)...)
 }
 
-// Sync flushes any buffered log entries.
-func (l *Logger) Sync() error {
-	return l.zapLogger.Sync()
-}
+/* -------------------------------------------------------------------------- */
+/*                          Structured Fields Helper                           */
+/* -------------------------------------------------------------------------- */
 
-// Field represents a key-value pair for structured logging.
 type Field struct {
 	Key   string
 	Value interface{}
 }
 
-// String creates a field with a string value.
-func String(key, value string) Field {
-	return Field{Key: key, Value: value}
-}
-
-// Int creates a field with an integer value.
-func Int(key string, value int) Field {
-	return Field{Key: key, Value: value}
-}
-
-// Float64 creates a field with a float64 value.
-func Float64(key string, value float64) Field {
-	return Field{Key: key, Value: value}
-}
-
-// Error creates a field with an error value.
-func Error(err error) Field {
-	return Field{Key: "error", Value: err}
-}
-
-// Duration creates a field with a time.Duration value.
+// Primitive helpers – keep the API identical to the original library.
+func String(key, value string) Field          { return Field{Key: key, Value: value} }
+func Int(key string, value int) Field         { return Field{Key: key, Value: value} }
+func Float64(key string, value float64) Field { return Field{Key: key, Value: value} }
+func Err(err error) Field                     { return Field{Key: "error", Value: err} }
 func Duration(key string, value time.Duration) Field {
 	return Field{Key: key, Value: value}
 }
+func Any(key string, value interface{}) Field { return Field{Key: key, Value: value} }
 
-// Any creates a field with an arbitrary value.
-func Any(key string, value interface{}) Field {
-	return Field{Key: key, Value: value}
-}
-
-// toZapLevel converts the package's Level to zapcore.Level.
-func toZapLevel(lvl Level) zapcore.Level {
-	switch lvl {
-	case DebugLevel:
-		return zapcore.DebugLevel
-	case InfoLevel:
-		return zapcore.InfoLevel
-	case WarnLevel:
-		return zapcore.WarnLevel
-	case ErrorLevel:
-		return zapcore.ErrorLevel
-	case FatalLevel:
-		return zapcore.FatalLevel
-	default:
-		return zapcore.InfoLevel
-	}
-}
-
-// toZapFields converts the package's Fields to zapcore.Fields.
+// Convert our custom Field slice into zapcore.Fields.
 func toZapFields(fields []Field) []zapcore.Field {
 	zapFields := make([]zapcore.Field, len(fields))
 	for i, f := range fields {
@@ -310,19 +380,60 @@ func toZapFields(fields []Field) []zapcore.Field {
 	return zapFields
 }
 
-// gcpZapCore is a custom zapcore.Core for Google Cloud Logging.
+/* -------------------------------------------------------------------------- */
+/*                         Level Conversion Helpers                            */
+/* -------------------------------------------------------------------------- */
+
+func toZapLevel(lvl Level) zapcore.Level {
+	switch lvl {
+	case DebugLevel:
+		return zapcore.DebugLevel
+	case InfoLevel:
+		return zapcore.InfoLevel
+	case WarnLevel:
+		return zapcore.WarnLevel
+	case ErrorLevel:
+		return zapcore.ErrorLevel
+	case FatalLevel:
+		return zapcore.FatalLevel
+	default:
+		// Gracefully fall back – callers get a sensible default.
+		return zapcore.InfoLevel
+	}
+}
+
+/* -------------------------------------------------------------------------- */
+/*                     Encoder Construction Utility                             */
+/* -------------------------------------------------------------------------- */
+
+func buildEncoder(t EncoderType) (zapcore.Encoder, error) {
+	encCfg := zap.NewProductionEncoderConfig()
+	// Show durations as human‑readable strings (e.g. “5ms”) instead of a float.
+	encCfg.EncodeDuration = zapcore.StringDurationEncoder
+
+	switch t {
+	case ConsoleEncoder:
+		return zapcore.NewConsoleEncoder(encCfg), nil
+	case JSONEncoder:
+		return zapcore.NewJSONEncoder(encCfg), nil
+	default:
+		// Unknown encoder – default to JSON and surface a clear error for the caller.
+		return zapcore.NewJSONEncoder(encCfg), fmt.Errorf("unsupported encoder type %q, falling back to JSON", t)
+	}
+}
+
+/* -------------------------------------------------------------------------- */
+/*                     Google Cloud Zap Core Implementation                     */
+/* -------------------------------------------------------------------------- */
+
 type gcpZapCore struct {
 	logger *logging.Logger
 	level  zapcore.Level
 	fields map[string]interface{}
 }
 
-// Enabled checks if the log level is enabled.
-func (c *gcpZapCore) Enabled(lvl zapcore.Level) bool {
-	return lvl >= c.level
-}
+func (c *gcpZapCore) Enabled(lvl zapcore.Level) bool { return lvl >= c.level }
 
-// With adds fields to the core.
 func (c *gcpZapCore) With(fields []zapcore.Field) zapcore.Core {
 	clone := *c
 	clone.fields = make(map[string]interface{}, len(c.fields)+len(fields))
@@ -339,7 +450,6 @@ func (c *gcpZapCore) With(fields []zapcore.Field) zapcore.Core {
 	return &clone
 }
 
-// Check determines if the entry should be logged.
 func (c *gcpZapCore) Check(ent zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
 	if c.Enabled(ent.Level) {
 		return ce.AddCore(ent, c)
@@ -347,7 +457,6 @@ func (c *gcpZapCore) Check(ent zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore
 	return ce
 }
 
-// Write writes the log entry.
 func (c *gcpZapCore) Write(ent zapcore.Entry, fields []zapcore.Field) error {
 	payload := make(map[string]interface{}, len(c.fields)+len(fields)+4)
 	for k, v := range c.fields {
@@ -361,27 +470,21 @@ func (c *gcpZapCore) Write(ent zapcore.Entry, fields []zapcore.Field) error {
 		payload[k] = v
 	}
 	payload["message"] = ent.Message
-	// Add caller information as fields since SourceLocation is not available
 	if ent.Caller.Defined {
 		payload["source_file"] = ent.Caller.File
 		payload["source_line"] = ent.Caller.Line
 		payload["source_function"] = ent.Caller.Function
 	}
-
-	sev := levelToSeverity(ent.Level)
-	logEntry := logging.Entry{
+	severity := levelToSeverity(ent.Level)
+	c.logger.Log(logging.Entry{
 		Timestamp: ent.Time,
-		Severity:  sev,
+		Severity:  severity,
 		Payload:   payload,
-	}
-	c.logger.Log(logEntry)
+	})
 	return nil
 }
 
-// Sync flushes the logger.
-func (c *gcpZapCore) Sync() error {
-	return c.logger.Flush()
-}
+func (c *gcpZapCore) Sync() error { return c.logger.Flush() }
 
 func levelToSeverity(lvl zapcore.Level) logging.Severity {
 	switch lvl {
@@ -402,4 +505,18 @@ func levelToSeverity(lvl zapcore.Level) logging.Severity {
 	default:
 		return logging.Default
 	}
+}
+
+/* -------------------------------------------------------------------------- */
+/*                     Helper to Close All Providers                           */
+/* -------------------------------------------------------------------------- */
+
+func closeProviders(provs []provider) error {
+	var first error
+	for _, p := range provs {
+		if err := p.close(); err != nil && first == nil {
+			first = fmt.Errorf("provider close error: %w", err)
+		}
+	}
+	return first
 }

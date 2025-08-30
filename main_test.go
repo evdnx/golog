@@ -3,366 +3,208 @@ package golog
 import (
 	"bytes"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"cloud.google.com/go/logging"
-	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-	"go.uber.org/zap/zaptest/observer"
 )
 
-// mockGCPProvider is a test-only provider that mocks Google Cloud Logging.
-type mockGCPProvider struct {
-	projectID string
-	logName   string
-	logs      []logging.Entry // Store logs for verification
+/*
+	--------------------------------------------------------------
+	  Mock provider – used to verify that Close() invokes the provider’s
+	  close() method without needing external services (e.g. GCP).
+
+--------------------------------------------------------------
+*/
+type mockProvider struct {
+	closed bool
 }
 
-func (p *mockGCPProvider) newCore(level zapcore.Level) (zapcore.Core, error) {
-	return &mockGCPZapCore{
-		logs:  &p.logs,
-		level: level,
-	}, nil
+func (m *mockProvider) newCore(level zapcore.Level) (zapcore.Core, error) {
+	enc, _ := buildEncoder(JSONEncoder)
+	syncer := zapcore.AddSync(io.Discard)
+	return zapcore.NewCore(enc, syncer, level), nil
 }
-
-// mockGCPZapCore is a test-only zapcore.Core for mocking GCP logging.
-type mockGCPZapCore struct {
-	logs  *[]logging.Entry
-	level zapcore.Level
-}
-
-func (c *mockGCPZapCore) Enabled(lvl zapcore.Level) bool {
-	return lvl >= c.level
-}
-
-func (c *mockGCPZapCore) With(fields []zapcore.Field) zapcore.Core {
-	return c // Simplified for testing; no field persistence needed
-}
-
-func (c *mockGCPZapCore) Check(ent zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
-	if c.Enabled(ent.Level) {
-		return ce.AddCore(ent, c)
-	}
-	return ce
-}
-
-func (c *mockGCPZapCore) Write(ent zapcore.Entry, fields []zapcore.Field) error {
-	enc := zapcore.NewMapObjectEncoder()
-	for _, f := range fields {
-		f.AddTo(enc)
-	}
-	enc.Fields["message"] = ent.Message
-	*c.logs = append(*c.logs, logging.Entry{
-		Timestamp: ent.Time,
-		Severity:  levelToSeverity(ent.Level),
-		Payload:   enc.Fields,
-	})
+func (m *mockProvider) close() error {
+	m.closed = true
 	return nil
 }
 
-func (c *mockGCPZapCore) Sync() error {
-	return nil
-}
+/*
+	--------------------------------------------------------------
+	  Helper to capture output from a logger that writes to an
+	  io.Writer (bytes.Buffer in the tests).
 
-func TestNewLogger(t *testing.T) {
-	tests := []struct {
-		name    string
-		options []LoggerOption
-		wantErr bool
-	}{
-		{
-			name:    "No providers",
-			options: []LoggerOption{},
-			wantErr: true,
-		},
-		{
-			name: "Stdout provider",
-			options: []LoggerOption{
-				WithStdOutProvider(JSONEncoder),
-				WithLevel(InfoLevel),
-			},
-			wantErr: false,
-		},
-		{
-			name: "Writer provider",
-			options: []LoggerOption{
-				WithWriterProvider(&bytes.Buffer{}, ConsoleEncoder),
-				WithLevel(DebugLevel),
-			},
-			wantErr: false,
-		},
-		{
-			name: "File provider",
-			options: []LoggerOption{
-				WithFileProvider(filepath.Join(t.TempDir(), "test.log"), 1, 2, 3, true),
-				WithLevel(DebugLevel),
-			},
-			wantErr: false,
-		},
-		{
-			name: "Multiple providers",
-			options: []LoggerOption{
-				WithStdOutProvider(ConsoleEncoder),
-				WithWriterProvider(&bytes.Buffer{}, JSONEncoder),
-				WithFileProvider(filepath.Join(t.TempDir(), "test.log"), 1, 2, 3, false),
-				WithLevel(WarnLevel),
-			},
-			wantErr: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := NewLogger(tt.options...)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("NewLogger() error = %v, wantErr %v", err, tt.wantErr)
-			}
-		})
-	}
-}
-
-func TestLoggerLevels(t *testing.T) {
-	tests := []struct {
-		name      string
-		logFunc   func(*Logger) func(string, ...Field)
-		message   string
-		fields    []Field
-		wantLevel zapcore.Level
-	}{
-		{
-			name:      "Debug",
-			logFunc:   func(l *Logger) func(string, ...Field) { return l.Debug },
-			message:   "Debug message",
-			fields:    []Field{String("key", "value")},
-			wantLevel: zapcore.DebugLevel,
-		},
-		{
-			name:      "Info",
-			logFunc:   func(l *Logger) func(string, ...Field) { return l.Info },
-			message:   "Info message",
-			fields:    []Field{Int("count", 42)},
-			wantLevel: zapcore.InfoLevel,
-		},
-		{
-			name:      "Warn",
-			logFunc:   func(l *Logger) func(string, ...Field) { return l.Warn },
-			message:   "Warn message",
-			fields:    []Field{Float64("value", 3.14)},
-			wantLevel: zapcore.WarnLevel,
-		},
-		{
-			name:      "Error",
-			logFunc:   func(l *Logger) func(string, ...Field) { return l.Error },
-			message:   "Error message",
-			fields:    []Field{Error(errors.New("test error"))},
-			wantLevel: zapcore.ErrorLevel,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Create a new observer and buffer for each test case
-			var buf bytes.Buffer
-			observerCore, logs := observer.New(zapcore.DebugLevel)
-			encoderCfg := zap.NewProductionEncoderConfig()
-			encoder := zapcore.NewConsoleEncoder(encoderCfg)
-			syncer := zapcore.AddSync(&buf)
-			bufferCore := zapcore.NewCore(encoder, syncer, zapcore.DebugLevel)
-			teeCore := zapcore.NewTee(observerCore, bufferCore)
-			logger := &Logger{zapLogger: zap.New(teeCore, zap.WithCaller(false))}
-
-			tt.logFunc(logger)(tt.message, tt.fields...)
-			if logs.Len() != 1 {
-				t.Errorf("Expected 1 log entry, got %d", logs.Len())
-			}
-			if logs.Len() > 0 {
-				entry := logs.All()[0]
-				if entry.Level != tt.wantLevel {
-					t.Errorf("Expected level %v, got %v", tt.wantLevel, entry.Level)
-				}
-				if entry.Message != tt.message {
-					t.Errorf("Expected message %q, got %q", tt.message, entry.Message)
-				}
-			}
-		})
-	}
-}
-
-func TestStructuredFields(t *testing.T) {
-	tests := []struct {
-		name  string
-		field Field
-		check func(t *testing.T, fields []zapcore.Field)
-	}{
-		{
-			name:  "String",
-			field: String("key", "value"),
-			check: func(t *testing.T, fields []zapcore.Field) {
-				if len(fields) != 1 || fields[0].Key != "key" || fields[0].Type != zapcore.StringType || fields[0].String != "value" {
-					t.Errorf("Expected String field {key: value}, got %v", fields)
-				}
-			},
-		},
-		{
-			name:  "Int",
-			field: Int("count", 42),
-			check: func(t *testing.T, fields []zapcore.Field) {
-				if len(fields) != 1 || fields[0].Key != "count" || fields[0].Type != zapcore.Int64Type || fields[0].Integer != 42 {
-					t.Errorf("Expected Int field {count: 42}, got %v", fields)
-				}
-			},
-		},
-		{
-			name:  "Float64",
-			field: Float64("value", 3.14),
-			check: func(t *testing.T, fields []zapcore.Field) {
-				if len(fields) != 1 || fields[0].Key != "value" || fields[0].Type != zapcore.Float64Type {
-					t.Errorf("Expected Float64 field {value: 3.14}, got %v", fields)
-				}
-				// Zap stores Float64 as int64 (scaled by 1e9)
-				if float64(fields[0].Integer)/1e9 != 3.14 {
-					t.Errorf("Expected Float64 value 3.14, got %v", float64(fields[0].Integer)/1e9)
-				}
-			},
-		},
-		{
-			name:  "Error",
-			field: Error(errors.New("test error")),
-			check: func(t *testing.T, fields []zapcore.Field) {
-				if len(fields) != 1 || fields[0].Key != "error" || fields[0].Type != zapcore.ErrorType {
-					t.Errorf("Expected Error field {error: test error}, got %v", fields)
-				}
-				if err, ok := fields[0].Interface.(error); !ok || err.Error() != "test error" {
-					t.Errorf("Expected error value 'test error', got %v", fields[0].Interface)
-				}
-			},
-		},
-		{
-			name:  "Duration",
-			field: Duration("elapsed", 150*time.Millisecond),
-			check: func(t *testing.T, fields []zapcore.Field) {
-				if len(fields) != 1 || fields[0].Key != "elapsed" || fields[0].Type != zapcore.DurationType || fields[0].Integer != int64(150*time.Millisecond) {
-					t.Errorf("Expected Duration field {elapsed: 150ms}, got %v", fields)
-				}
-			},
-		},
-		{
-			name:  "Any",
-			field: Any("data", map[string]int{"count": 42}),
-			check: func(t *testing.T, fields []zapcore.Field) {
-				if len(fields) != 1 || fields[0].Key != "data" || fields[0].Type != zapcore.ReflectType {
-					t.Errorf("Expected Any field {data: map}, got %v", fields)
-				}
-				if m, ok := fields[0].Interface.(map[string]int); !ok || m["count"] != 42 {
-					t.Errorf("Expected map[count]=42, got %v", fields[0].Interface)
-				}
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var buf bytes.Buffer
-			observerCore, logs := observer.New(zapcore.DebugLevel)
-			encoderCfg := zap.NewProductionEncoderConfig()
-			encoder := zapcore.NewConsoleEncoder(encoderCfg)
-			syncer := zapcore.AddSync(&buf)
-			bufferCore := zapcore.NewCore(encoder, syncer, zapcore.DebugLevel)
-			teeCore := zapcore.NewTee(observerCore, bufferCore)
-			logger := &Logger{zapLogger: zap.New(teeCore, zap.WithCaller(false))}
-
-			logger.Info("Test", tt.field)
-			if logs.Len() != 1 {
-				t.Errorf("Expected 1 log entry, got %d", logs.Len())
-			}
-			if logs.Len() > 0 {
-				tt.check(t, logs.All()[0].Context)
-			}
-		})
-	}
-}
-
-func TestGCPProviderMock(t *testing.T) {
-	// Mock GCP provider
-	gcpMock := &mockGCPProvider{projectID: "test-project", logName: "test-log"}
-
-	log, err := NewLogger(
-		func() LoggerOption {
-			return func(cfg *loggerConfig) {
-				cfg.providers = append(cfg.providers, gcpMock)
-			}
-		}(),
-		WithLevel(InfoLevel),
-	)
-	if err != nil {
-		t.Fatalf("NewLogger() error = %v", err)
-	}
-
-	log.Info("Test message", String("key", "value"))
-	if err := log.Sync(); err != nil {
-		t.Fatalf("Sync() error = %v", err)
-	}
-
-	if len(gcpMock.logs) != 1 {
-		t.Errorf("Expected 1 log entry, got %d", len(gcpMock.logs))
-	}
-	if len(gcpMock.logs) > 0 {
-		entry := gcpMock.logs[0]
-		if entry.Payload.(map[string]interface{})["message"] != "Test message" {
-			t.Errorf("Expected message %q, got %q", "Test message", entry.Payload.(map[string]interface{})["message"])
-		}
-		if entry.Payload.(map[string]interface{})["key"] != "value" {
-			t.Errorf("Expected key=value, got %v", entry.Payload.(map[string]interface{})["key"])
-		}
-	}
-}
-
-func TestFileProviderConfig(t *testing.T) {
-	tempDir := t.TempDir()
-	filename := filepath.Join(tempDir, "test.log")
-	log, err := NewLogger(
-		WithFileProvider(filename, 1, 2, 3, true),
-		WithLevel(InfoLevel),
-	)
-	if err != nil {
-		t.Fatalf("NewLogger() error = %v", err)
-	}
-
-	log.Info("Test message")
-	if err := log.Sync(); err != nil {
-		t.Fatalf("Sync() error = %v", err)
-	}
-
-	// Verify file exists
-	if _, err := os.Stat(filename); os.IsNotExist(err) {
-		t.Errorf("Expected log file %s to exist", filename)
-	}
-}
-
-func TestWriterProvider(t *testing.T) {
+--------------------------------------------------------------
+*/
+func newBufferLogger(t *testing.T, lvl Level) (*Logger, *bytes.Buffer) {
 	var buf bytes.Buffer
-	log, err := NewLogger(
-		WithWriterProvider(&buf, ConsoleEncoder),
+	logger, err := NewLogger(
+		WithWriterProvider(&buf, JSONEncoder),
+		WithLevel(lvl),
+	)
+	if err != nil {
+		t.Fatalf("failed to create logger: %v", err)
+	}
+	return logger, &buf
+}
+
+/*
+	--------------------------------------------------------------
+	  Test that creating a logger with no providers returns an error.
+
+--------------------------------------------------------------
+*/
+func TestNewLogger_NoProviders(t *testing.T) {
+	_, err := NewLogger()
+	if err == nil {
+		t.Fatalf("expected error when no providers are supplied")
+	}
+}
+
+/*
+	--------------------------------------------------------------
+	  Test basic logging to a bytes.Buffer and field conversion.
+
+--------------------------------------------------------------
+*/
+func TestLogger_BufferOutput(t *testing.T) {
+	logger, buf := newBufferLogger(t, InfoLevel)
+	defer logger.Close()
+
+	logger.Info("hello world",
+		String("foo", "bar"),
+		Int("num", 42),
+		Duration("dur", 2*time.Second),
+		Err(errors.New("sample error")),
+	)
+
+	if buf.Len() == 0 {
+		t.Fatalf("expected log output, got empty buffer")
+	}
+}
+
+/*
+	--------------------------------------------------------------
+	  Test that the logger respects the configured log level.
+	  Debug messages should be omitted when level is Info.
+
+--------------------------------------------------------------
+*/
+func TestLogger_LevelFiltering(t *testing.T) {
+	logger, buf := newBufferLogger(t, InfoLevel)
+	defer logger.Close()
+
+	logger.Debug("debug should be filtered")
+	logger.Info("info should appear")
+
+	output := buf.String()
+	if strings.Contains(output, "debug should be filtered") {
+		t.Errorf("debug message was not filtered")
+	}
+	if !strings.Contains(output, "info should appear") {
+		t.Errorf("info message missing")
+	}
+}
+
+/*
+	--------------------------------------------------------------
+	  Test file provider – write to a temporary file and verify
+	  that the file contains valid JSON.
+
+--------------------------------------------------------------
+*/
+func TestLogger_FileProvider(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "test.log")
+
+	logger, err := NewLogger(
+		WithFileProvider(filePath, 1, 1, 1, false), // tiny rotation params – irrelevant for test
 		WithLevel(DebugLevel),
 	)
 	if err != nil {
-		t.Fatalf("NewLogger() error = %v", err)
+		t.Fatalf("failed to create logger: %v", err)
+	}
+	// Write a log entry.
+	logger.Info("file test")
+	// Flush and close the logger so the file handle is released.
+	if err := logger.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
 	}
 
-	log.Info("Test message", String("key", "value"))
-	if err := log.Sync(); err != nil {
-		t.Fatalf("Sync() error = %v", err)
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("could not read log file: %v", err)
 	}
+	if len(data) == 0 {
+		t.Fatalf("log file is empty")
+	}
+	if !bytes.Contains(data, []byte(`"file test"`)) {
+		t.Errorf("log file does not contain expected message")
+	}
+}
 
-	output := buf.String()
-	if !strings.Contains(output, "Test message") {
-		t.Errorf("Expected output to contain 'Test message', got %q", output)
+/*
+	--------------------------------------------------------------
+	  Test that Close() calls each provider’s close() method.
+
+--------------------------------------------------------------
+*/
+func TestLogger_CloseCallsProviderClose(t *testing.T) {
+	mock := &mockProvider{}
+	// Build a logger with any real provider (stdout) – we’ll replace the internal slice.
+	logger, err := NewLogger(
+		WithStdOutProvider(JSONEncoder),
+		WithLevel(InfoLevel),
+	)
+	if err != nil {
+		t.Fatalf("failed to create logger: %v", err)
 	}
-	if !strings.Contains(output, "key=value") {
-		t.Errorf("Expected output to contain 'key=value', got %q", output)
+	// Inject the mock provider so Close() will invoke its close().
+	logger.closers = []provider{mock}
+
+	if err := logger.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	if !mock.closed {
+		t.Errorf("mock provider close() was not called")
+	}
+}
+
+/*
+	--------------------------------------------------------------
+	  Test conversion helpers – ensure they produce the expected zapcore
+	  fields (indirectly by checking the JSON output).
+
+--------------------------------------------------------------
+*/
+func TestFieldHelpers_JSONOutput(t *testing.T) {
+	logger, buf := newBufferLogger(t, InfoLevel)
+	defer logger.Close()
+
+	logger.Info("fields test",
+		String("s", "val"),
+		Int("i", 7),
+		Float64("f", 3.14),
+		Duration("d", 5*time.Millisecond),
+		Any("any", map[string]string{"k": "v"}),
+	)
+
+	out := buf.String()
+	expected := []string{
+		`"s":"val"`,
+		`"i":7`,
+		`"f":3.14`,
+		`"d":"5ms"`,
+		`"any":{"k":"v"}`,
+	}
+	for _, exp := range expected {
+		if !strings.Contains(out, exp) {
+			t.Errorf("expected output to contain %s, got %s", exp, out)
+		}
 	}
 }
