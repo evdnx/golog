@@ -204,6 +204,12 @@ type loggerConfig struct {
 	closers []provider
 }
 
+func defaultProvider() provider {
+	// Choose the encoder you prefer for the default stdout logger.
+	// Here we use the console encoder for readability.
+	return stdOutProvider{encoderType: ConsoleEncoder}
+}
+
 // WithStdOutProvider adds a stdout destination.
 func WithStdOutProvider(encoderType EncoderType) LoggerOption {
 	return func(cfg *loggerConfig) {
@@ -272,29 +278,33 @@ func NewLogger(options ...LoggerOption) (*Logger, error) {
 		level:     InfoLevel, // default
 	}
 
+	// Apply all supplied options.
 	for _, opt := range options {
 		opt(cfg)
 	}
 
+	// If the caller didn’t add any providers, fall back to stdout.
 	if len(cfg.providers) == 0 {
-		return nil, errors.New("no providers specified")
+		cfg.providers = append(cfg.providers, defaultProvider())
 	}
+	// ---------------------
 
 	var cores []zapcore.Core
 	for _, p := range cfg.providers {
 		core, err := p.newCore(toZapLevel(cfg.level))
 		if err != nil {
-			// Attempt to close any providers already initialised.
+			// Clean up any providers that were already initialised.
 			_ = closeProviders(cfg.providers)
 			return nil, fmt.Errorf("failed to initialise provider: %w", err)
 		}
 		cores = append(cores, core)
-		// Keep track of providers that implement close().
+		// Track providers that need explicit shutdown.
 		cfg.closers = append(cfg.closers, p)
 	}
 
 	teeCore := zapcore.NewTee(cores...)
-	zapLogger := zap.New(teeCore, zap.AddCaller()) // always capture caller info
+	zapLogger := zap.New(teeCore, zap.AddCaller())
+
 	return &Logger{zapLogger: zapLogger, closers: cfg.closers}, nil
 }
 

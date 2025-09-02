@@ -169,15 +169,3 @@ To add a new provider (e.g., a custom cloud service):
 ## License  
 
 MIT-0 (no attrib) – see the `LICENSE` file.
-
-## Contributing  
-
-Contributions are welcome! Please follow these steps:
-
-1. Fork the repository.  
-2. Create a feature branch (`git checkout -b feat/my‑feature`).  
-3. Write code **and** accompanying tests.  
-4. Run `go vet ./...` and `go test -v ./...` locally.  
-5. Open a Pull Request describing the change and linking any relevant issues.
-
-Thank you for helping make this logger better! 🎉

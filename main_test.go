@@ -55,19 +55,6 @@ func newBufferLogger(t *testing.T, lvl Level) (*Logger, *bytes.Buffer) {
 
 /*
 	--------------------------------------------------------------
-	  Test that creating a logger with no providers returns an error.
-
---------------------------------------------------------------
-*/
-func TestNewLogger_NoProviders(t *testing.T) {
-	_, err := NewLogger()
-	if err == nil {
-		t.Fatalf("expected error when no providers are supplied")
-	}
-}
-
-/*
-	--------------------------------------------------------------
 	  Test basic logging to a bytes.Buffer and field conversion.
 
 --------------------------------------------------------------
@@ -156,14 +143,17 @@ func TestLogger_FileProvider(t *testing.T) {
 */
 func TestLogger_CloseCallsProviderClose(t *testing.T) {
 	mock := &mockProvider{}
-	// Build a logger with any real provider (stdout) – we’ll replace the internal slice.
+
+	// Use a buffer (or io.Discard) instead of stdout.
+	var buf bytes.Buffer
 	logger, err := NewLogger(
-		WithStdOutProvider(JSONEncoder),
+		WithWriterProvider(&buf, JSONEncoder), // ← replaces the stdout provider
 		WithLevel(InfoLevel),
 	)
 	if err != nil {
 		t.Fatalf("failed to create logger: %v", err)
 	}
+
 	// Inject the mock provider so Close() will invoke its close().
 	logger.closers = []provider{mock}
 
