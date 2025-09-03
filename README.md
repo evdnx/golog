@@ -97,15 +97,27 @@ func main() {
 > **Tip:** The underlying implementation uses **lumberjack**; all values are passed straight through, so the semantics match the lumberjack documentation.
 
 ## Logging Methods
-```go
-Debug(msg string, fields ...Field)
-Info(msg string, fields ...Field)
-Warn(msg string, fields ...Field)
-Error(msg string, fields ...Field)
-Fatal(msg string, fields ...Field) // calls os.Exit(1) after logging
-Sync() error // flushes buffered entries
-Close() error // Sync + provider cleanup (recommended)
-```
+| Method | Signature | Example |
+|--------|-----------|---------|
+| `Debug(msg string, fields …Field)` | `Debug(msg string, fields …Field)` | `logger.Debug("starting job", golog.String("jobID", id))` |
+| `Info(msg string, fields …Field)` | `Info(msg string, fields …Field)` | `logger.Info("user logged in", golog.String("user", name))` |
+| `Warn(msg string, fields …Field)` | `Warn(msg string, fields …Field)` | `logger.Warn("disk space low", golog.Int("percent", 5))` |
+| `Error(msg string, fields …Field)` | `Error(msg string, fields …Field)` | `logger.Error("request failed", golog.Error(err))` |
+| `Fatal(msg string, fields …Field)` | `Fatal(msg string, fields …Field)` | `logger.Fatal("unrecoverable error", golog.Error(err))` |
+| `Sync() error` | `Sync() error` | `if err := logger.Sync(); err != nil { … }` |
+| `Close() error` | `Close() error` | `defer logger.Close()` |
+| **Sugared (formatted) methods** | | |
+| `Debugf(format string, args …interface{})` | `Debugf(format string, args …interface{})` | `logger.Debugf("processing %d items", n)` |
+| `Infof(format string, args …interface{})` | `Infof(format string, args …interface{})` | `logger.Infof("user %s logged in", username)` |
+| `Warnf(format string, args …interface{})` | `Warnf(format string, args …interface{})` | `logger.Warnf("retry %d of %d", attempt, maxAttempts)` |
+| `Errorf(format string, args …interface{})` | `Errorf(format string, args …interface{})` | `logger.Errorf("failed to open %s: %v", path, err)` |
+| `Fatalf(format string, args …interface{})` | `Fatalf(format string, args …interface{})` | `logger.Fatalf("cannot start: %v", err)` |
+| **Sugared (key/value) methods** | | |
+| `Debugw(msg string, keysAndValues …interface{})` | `Debugw(msg string, keysAndValues …interface{})` | `logger.Debugw("cache miss", "key", k, "ttl", ttl)` |
+| `Infow(msg string, keysAndValues …interface{})` | `Infow(msg string, keysAndValues …interface{})` | `logger.Infow("order placed", "orderID", id, "amount", amt)` |
+| `Warnw(msg string, keysAndValues …interface{})` | `Warnw(msg string, keysAndValues …interface{})` | `logger.Warnw("high latency", "endpoint", url, "ms", ms)` |
+| `Errorw(msg string, keysAndValues …interface{})` | `Errorw(msg string, keysAndValues …interface{})` | `logger.Errorw("db error", "query", q, "err", err)` |
+| `Fatalw(msg string, keysAndValues …interface{})` | `Fatalw(msg string, keysAndValues …interface{})` | `logger.Fatalw("service crash", "reason", r)` |
 
 
 ## Structured Field Helpers  
