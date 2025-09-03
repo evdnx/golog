@@ -200,21 +200,15 @@ func TestFieldHelpers_JSONOutput(t *testing.T) {
 }
 
 /*
-TestSugarMethods validates every sugar wrapper you introduced:
+TestSugarMethods validates every *non‑fatal* sugar wrapper:
 
-	Debugf / Infof / Warnf / Errorf / Fatalf
-	Debugw / Infow / Warnw / Errorw / Fatalw
+	Debugf / Infof / Warnf / Errorf
+	Debugw / Infow / Warnw / Errorw
 
-The test:
-
-	1️⃣ Creates a logger that writes JSON to a bytes.Buffer.
-	2️⃣ Calls each method once with distinct data.
-	3️⃣ Flushes the logger so all entries reach the buffer.
-	4️⃣ Parses the buffer line‑by‑line and asserts that the expected
-	   fields (message text, formatted values, key/value pairs) appear.
-	5️⃣ Confirms that the fatal methods still emit a log line
-	   (the actual process‑exit is not intercepted because zap.Exit
-	   isn’t exported in the bundled version).
+The fatal variants (`Fatalf`, `Fatalw`) are intentionally omitted from this
+unit test because they invoke `os.Exit(1)` via zap’s internal exit handler,
+which would abort the test process. If you need an end‑to‑end verification,
+run those calls in a separate binary or use a subprocess harness.
 */
 func TestSugarMethods(t *testing.T) {
 	// ------------------------------------------------------------
@@ -228,7 +222,7 @@ func TestSugarMethods(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create logger: %v", err)
 	}
-	// Ensure we always clean up resources.
+	// Ensure resources are cleaned up even if the test fails.
 	defer func() {
 		if cerr := logger.Close(); cerr != nil {
 			t.Fatalf("logger.Close error: %v", cerr)
@@ -236,20 +230,19 @@ func TestSugarMethods(t *testing.T) {
 	}()
 
 	// ------------------------------------------------------------
-	// 2️⃣ Exercise every sugar method once.
+	// 2️⃣ Exercise every *non‑fatal* sugar method once.
 	// ------------------------------------------------------------
 	logger.Debugf("debug %d %s", 1, "msg")
 	logger.Infof("info %d %s", 2, "msg")
 	logger.Warnf("warn %d %s", 3, "msg")
 	logger.Errorf("error %d %s", 4, "msg")
-	// Fatal* still logs before exiting; we only care about the log line.
-	logger.Fatalf("fatal %d %s", 5, "msg")
+	// logger.Fatalf(...)   // ← omitted – would call os.Exit(1)
 
 	logger.Debugw("debugw", "k1", "v1", "k2", 2)
 	logger.Infow("infow", "k1", "v1", "k2", 2)
 	logger.Warnw("warnw", "k1", "v1", "k2", 2)
 	logger.Errorw("errorw", "k1", "v1", "k2", 2)
-	logger.Fatalw("fatalw", "k1", "v1", "k2", 2) // same note as Fatalf
+	// logger.Fatalw(...)   // ← omitted – would call os.Exit(1)
 
 	// ------------------------------------------------------------
 	// 3️⃣ Flush the logger so all buffered entries are written.
@@ -264,8 +257,8 @@ func TestSugarMethods(t *testing.T) {
 	output := buf.String()
 	lines := strings.Split(strings.TrimSpace(output), "\n")
 
-	// We expect ten lines – one per call above.
-	const expectedLines = 10
+	// Expect eight lines – one per call above (four *f + four *w).
+	const expectedLines = 8
 	if len(lines) != expectedLines {
 		t.Fatalf("expected %d log lines, got %d:\n%s", expectedLines, len(lines), output)
 	}
@@ -282,38 +275,33 @@ func TestSugarMethods(t *testing.T) {
 	contains(`"msg":"info 2 msg"`, lines[1])
 	contains(`"msg":"warn 3 msg"`, lines[2])
 	contains(`"msg":"error 4 msg"`, lines[3])
-	contains(`"msg":"fatal 5 msg"`, lines[4]) // Fatalf still logs
 
 	// ----------- *w variants -----------
-	contains(`"msg":"debugw"`, lines[5])
+	contains(`"msg":"debugw"`, lines[4])
+	contains(`"k1":"v1"`, lines[4])
+	contains(`"k2":2`, lines[4])
+
+	contains(`"msg":"infow"`, lines[5])
 	contains(`"k1":"v1"`, lines[5])
 	contains(`"k2":2`, lines[5])
 
-	contains(`"msg":"infow"`, lines[6])
+	contains(`"msg":"warnw"`, lines[6])
 	contains(`"k1":"v1"`, lines[6])
 	contains(`"k2":2`, lines[6])
 
-	contains(`"msg":"warnw"`, lines[7])
+	contains(`"msg":"errorw"`, lines[7])
 	contains(`"k1":"v1"`, lines[7])
 	contains(`"k2":2`, lines[7])
 
-	contains(`"msg":"errorw"`, lines[8])
-	contains(`"k1":"v1"`, lines[8])
-	contains(`"k2":2`, lines[8])
-
-	contains(`"msg":"fatalw"`, lines[9])
-	contains(`"k1":"v1"`, lines[9])
-	contains(`"k2":2`, lines[9])
-
 	// ------------------------------------------------------------
-	// 5️⃣ (Optional) Verify that the logger still works after fatal calls.
+	// 5️⃣ (Optional) Verify the logger still works after the calls.
 	// ------------------------------------------------------------
-	// Emit another entry to prove the logger wasn’t left in a broken state.
-	logger.Info("post‑fatal check")
+	logger.Info("post‑check")
 	if err := logger.Sync(); err != nil {
-		t.Fatalf("sync after post‑fatal check failed: %v", err)
+		t.Fatalf("sync after post‑check failed: %v", err)
 	}
-	if !strings.Contains(buf.String(), `"msg":"post-fatal check"`) {
-		t.Errorf("post‑fatal check message missing")
+	if !strings.Contains(buf.String(), `"msg":"post-check"`) && !strings.Contains(buf.String(), `"msg":"post‑check"`) {
+		// The exact string depends on your Go version’s dash handling.
+		t.Errorf("post‑check message missing")
 	}
 }
