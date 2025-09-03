@@ -267,6 +267,7 @@ func WithLevel(level Level) LoggerOption {
 
 type Logger struct {
 	zapLogger *zap.Logger
+	sugared   *zap.SugaredLogger
 	// keep a reference to the config so we can close providers later.
 	closers []provider
 }
@@ -304,8 +305,13 @@ func NewLogger(options ...LoggerOption) (*Logger, error) {
 
 	teeCore := zapcore.NewTee(cores...)
 	zapLogger := zap.New(teeCore, zap.AddCaller())
+	s := zapLogger.Sugar()
 
-	return &Logger{zapLogger: zapLogger, closers: cfg.closers}, nil
+	return &Logger{
+		zapLogger: zapLogger,
+		sugared:   s,
+		closers:   cfg.closers,
+	}, nil
 }
 
 // Close flushes the zap logger and shuts down any provider resources.
@@ -347,6 +353,46 @@ func (l *Logger) Error(msg string, fields ...Field) {
 // Fatal logs at Fatal level and then exits the process.
 func (l *Logger) Fatal(msg string, fields ...Field) {
 	l.zapLogger.Fatal(msg, toZapFields(fields)...)
+}
+
+func (l *Logger) Debugf(format string, args ...interface{}) {
+	l.sugared.Debugf(format, args...)
+}
+
+func (l *Logger) Infof(format string, args ...interface{}) {
+	l.sugared.Infof(format, args...)
+}
+
+func (l *Logger) Warnf(format string, args ...interface{}) {
+	l.sugared.Warnf(format, args...)
+}
+
+func (l *Logger) Errorf(format string, args ...interface{}) {
+	l.sugared.Errorf(format, args...)
+}
+
+func (l *Logger) Fatalf(format string, args ...interface{}) {
+	l.sugared.Fatalf(format, args...)
+}
+
+func (l *Logger) Debugw(msg string, keysAndValues ...interface{}) {
+	l.sugared.Debugw(msg, keysAndValues...)
+}
+
+func (l *Logger) Infow(msg string, keysAndValues ...interface{}) {
+	l.sugared.Infow(msg, keysAndValues...)
+}
+
+func (l *Logger) Warnw(msg string, keysAndValues ...interface{}) {
+	l.sugared.Warnw(msg, keysAndValues...)
+}
+
+func (l *Logger) Errorw(msg string, keysAndValues ...interface{}) {
+	l.sugared.Errorw(msg, keysAndValues...)
+}
+
+func (l *Logger) Fatalw(msg string, keysAndValues ...interface{}) {
+	l.sugared.Fatalw(msg, keysAndValues...)
 }
 
 /* -------------------------------------------------------------------------- */
