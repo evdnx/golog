@@ -2,11 +2,14 @@ package golog
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -303,5 +306,89 @@ func TestSugarMethods(t *testing.T) {
 	if !strings.Contains(buf.String(), `"msg":"post-check"`) && !strings.Contains(buf.String(), `"msg":"post‑check"`) {
 		// The exact string depends on your Go version’s dash handling.
 		t.Errorf("post‑check message missing")
+	}
+}
+
+func TestLogger_ConcurrentWrites(t *testing.T) {
+	const workers = 50
+	const msgsPerWorker = 200
+
+	logger, buf := newBufferLogger(t, DebugLevel)
+	defer logger.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+
+	for i := 0; i < workers; i++ {
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < msgsPerWorker; j++ {
+				logger.Info("concurrent msg",
+					String("worker", fmt.Sprintf("w%d", id)),
+					Int("seq", j),
+				)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Ensure we got roughly the right number of lines.
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	expected := workers * msgsPerWorker
+	if len(lines) != expected {
+		t.Fatalf("expected %d log lines, got %d", expected, len(lines))
+	}
+}
+
+func TestFileProvider_InvalidRotationParams(t *testing.T) {
+	_, err := NewLogger(
+		WithFileProvider("/tmp/bad.log", -1, 0, 0, false), // maxSize negative
+		WithLevel(DebugLevel),
+	)
+	if err == nil {
+		t.Fatalf("expected error for negative maxSize, got nil")
+	}
+	if !strings.Contains(err.Error(), "rotation parameters must be non‑negative") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func TestBuildEncoder_UnsupportedFallback(t *testing.T) {
+	enc, err := buildEncoder(EncoderType("xml")) // deliberately unsupported
+	if err == nil {
+		t.Fatalf("expected error for unknown encoder")
+	}
+	if !strings.Contains(err.Error(), "unsupported encoder type") {
+		t.Fatalf("unexpected error text: %v", err)
+	}
+	// The function still returns a JSON encoder so the logger can continue.
+	if enc == nil {
+		t.Fatalf("expected a non‑nil encoder fallback")
+	}
+}
+
+func TestLogger_WithContext(t *testing.T) {
+	ctx := context.WithValue(context.Background(), "trace_id", "abc123")
+	logger, buf := newBufferLogger(t, InfoLevel)
+	defer logger.Close()
+
+	// Suppose you add a method `InfoCtx(ctx, ...)` that pulls fields from ctx.
+	// For now we can simulate it manually:
+	logger.Info("ctx test", Any("trace_id", ctx.Value("trace_id")))
+
+	if !strings.Contains(buf.String(), `"trace_id":"abc123"`) {
+		t.Errorf("expected trace_id field in log output")
+	}
+}
+
+func TestLogger_CloseIdempotent(t *testing.T) {
+	logger, _ := newBufferLogger(t, InfoLevel)
+
+	if err := logger.Close(); err != nil {
+		t.Fatalf("first Close failed: %v", err)
+	}
+	// Second call – should be a no‑op.
+	if err := logger.Close(); err != nil {
+		t.Fatalf("second Close returned error: %v", err)
 	}
 }
