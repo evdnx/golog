@@ -309,12 +309,71 @@ func TestSugarMethods(t *testing.T) {
 	}
 }
 
+/*
+	-------------------------------------------------------------
+	  A very small thread‑safe buffer that satisfies io.Writer.
+	  It forwards all operations to an embedded bytes.Buffer
+	  while protecting them with a mutex.
+
+-------------------------------------------------------------
+*/
+type concurrentBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (c *concurrentBuffer) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.b.Write(p)
+}
+func (c *concurrentBuffer) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.b.String()
+}
+func (c *concurrentBuffer) Len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.b.Len()
+}
+
+/*
+	-------------------------------------------------------------
+	  Helper that builds a logger wired to the safe buffer.
+
+-------------------------------------------------------------
+*/
+func newSafeBufferLogger(t *testing.T, lvl Level) (*Logger, *concurrentBuffer) {
+	var buf concurrentBuffer
+	logger, err := NewLogger(
+		WithWriterProvider(&buf, JSONEncoder),
+		WithLevel(lvl),
+	)
+	if err != nil {
+		t.Fatalf("failed to create logger: %v", err)
+	}
+	return logger, &buf
+}
+
+/*
+	-------------------------------------------------------------
+	  The actual test – now deterministic.
+
+-------------------------------------------------------------
+*/
 func TestLogger_ConcurrentWrites(t *testing.T) {
 	const workers = 50
-	const msgsPerWorker = 200
+	const msgsPerWorker = 200 // 50 × 200 = 10 000 total messages
 
-	logger, buf := newBufferLogger(t, DebugLevel)
-	defer logger.Close()
+	logger, buf := newSafeBufferLogger(t, DebugLevel)
+	// Ensure everything is flushed before we inspect the buffer.
+	defer func() {
+		if err := logger.Sync(); err != nil {
+			t.Fatalf("final Sync failed: %v", err)
+		}
+		logger.Close()
+	}()
 
 	var wg sync.WaitGroup
 	wg.Add(workers)
@@ -323,7 +382,9 @@ func TestLogger_ConcurrentWrites(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for j := 0; j < msgsPerWorker; j++ {
-				logger.Info("concurrent msg",
+				// Make the message unique so Zap’s sampler (if any) won’t drop it.
+				msg := fmt.Sprintf("concurrent msg w%02d seq%04d", id, j)
+				logger.Info(msg,
 					String("worker", fmt.Sprintf("w%d", id)),
 					Int("seq", j),
 				)
@@ -332,7 +393,12 @@ func TestLogger_ConcurrentWrites(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Ensure we got roughly the right number of lines.
+	// Force Zap to write any buffered data.
+	if err := logger.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	// Count the lines that actually made it into the buffer.
 	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
 	expected := workers * msgsPerWorker
 	if len(lines) != expected {
