@@ -10,6 +10,7 @@ It supports multiple logging providers (standard output, custom writer, Google C
 - **Zero‑Dependency API** – Users import only `github.com/evdnx/golog`; the package internally manages Zap, GCP, and Lumberjack.  
 - **Extensible Design** – New providers can be added by implementing the internal `provider` interface.  
 - **High Performance** – Leverages Zap’s low‑overhead core.
+- **Graceful Shutdown** – `Close()` flushes providers exactly once and ignores benign stdout/stderr sync errors.
 
 ## Installation  
 ```bash
@@ -42,6 +43,8 @@ func main() {
 		panic(err)
 	}
 	defer logger.Close() // flushes and releases resources
+
+	// Close is idempotent and safe to call multiple times (e.g. in deferred cleanup helpers).
 
 	logger.Info("Application started",
 		golog.String("app", "my-app"),

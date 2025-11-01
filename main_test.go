@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -34,6 +35,26 @@ func (m *mockProvider) newCore(level zapcore.Level) (zapcore.Core, error) {
 }
 func (m *mockProvider) close() error {
 	m.closed = true
+	return nil
+}
+
+type countingProvider struct {
+	mu         sync.Mutex
+	closeCalls int
+}
+
+func (p *countingProvider) newCore(level zapcore.Level) (zapcore.Core, error) {
+	enc, err := buildEncoder(JSONEncoder)
+	if err != nil {
+		return nil, err
+	}
+	return zapcore.NewCore(enc, zapcore.AddSync(io.Discard), level), nil
+}
+
+func (p *countingProvider) close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closeCalls++
 	return nil
 }
 
@@ -165,6 +186,30 @@ func TestLogger_CloseCallsProviderClose(t *testing.T) {
 	}
 	if !mock.closed {
 		t.Errorf("mock provider close() was not called")
+	}
+}
+
+func TestLogger_CloseInvokesProvidersOnce(t *testing.T) {
+	counter := &countingProvider{}
+
+	logger, err := NewLogger(func(cfg *loggerConfig) {
+		cfg.providers = append(cfg.providers, counter)
+	})
+	if err != nil {
+		t.Fatalf("failed to create logger: %v", err)
+	}
+
+	if err := logger.Close(); err != nil {
+		t.Fatalf("first Close returned error: %v", err)
+	}
+	if err := logger.Close(); err != nil {
+		t.Fatalf("second Close returned error: %v", err)
+	}
+
+	counter.mu.Lock()
+	defer counter.mu.Unlock()
+	if counter.closeCalls != 1 {
+		t.Fatalf("expected provider close() once, got %d", counter.closeCalls)
 	}
 }
 
@@ -456,5 +501,19 @@ func TestLogger_CloseIdempotent(t *testing.T) {
 	// Second call – should be a no‑op.
 	if err := logger.Close(); err != nil {
 		t.Fatalf("second Close returned error: %v", err)
+	}
+}
+
+func TestIgnoreSyncError(t *testing.T) {
+	err := &os.PathError{
+		Op:   "sync",
+		Path: "/dev/stdout",
+		Err:  syscall.ENOTTY,
+	}
+	if ignoreSyncError(err) != nil {
+		t.Fatalf("expected ENOTTY path errors to be ignored")
+	}
+	if ignoreSyncError(syscall.EIO) == nil {
+		t.Fatalf("non-ignorable errors should be returned")
 	}
 }

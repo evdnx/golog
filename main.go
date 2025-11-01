@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
+	"syscall"
 	"time"
 
 	"cloud.google.com/go/logging"
@@ -116,13 +118,21 @@ func (p *gcpProvider) newCore(level zapcore.Level) (zapcore.Core, error) {
 	}, nil
 }
 func (p *gcpProvider) close() error {
+	var errs []error
+	if p.logger != nil {
+		if err := p.logger.Flush(); err != nil {
+			errs = append(errs, fmt.Errorf("gcpProvider: flush error: %w", err))
+		}
+	}
 	if p.client != nil {
 		// Flush pending entries before closing.
 		if err := p.client.Close(); err != nil {
-			return fmt.Errorf("gcpProvider: error closing client: %w", err)
+			errs = append(errs, fmt.Errorf("gcpProvider: error closing client: %w", err))
 		}
 	}
-	return nil
+	p.logger = nil
+	p.client = nil
+	return errors.Join(errs...)
 }
 
 /*
@@ -270,6 +280,9 @@ type Logger struct {
 	sugared   *zap.SugaredLogger
 	// keep a reference to the config so we can close providers later.
 	closers []provider
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // NewLogger builds a logger from the supplied functional options.
@@ -316,19 +329,32 @@ func NewLogger(options ...LoggerOption) (*Logger, error) {
 
 // Close flushes the zap logger and shuts down any provider resources.
 func (l *Logger) Close() error {
-	var firstErr error
-	// zap.Logger.Sync() never returns zap.ErrClosed, so we just propagate any error it gives.
-	if err := l.zapLogger.Sync(); err != nil {
-		firstErr = fmt.Errorf("zap sync error: %w", err)
-	}
-	if err := closeProviders(l.closers); err != nil && firstErr == nil {
-		firstErr = err
-	}
-	return firstErr
+	l.closeOnce.Do(func() {
+		if l.zapLogger == nil {
+			return
+		}
+
+		// zap.Logger.Sync() can return benign errors on stdout/stderr (e.g. ENOTTY).
+		if err := ignoreSyncError(l.zapLogger.Sync()); err != nil {
+			l.closeErr = fmt.Errorf("zap sync error: %w", err)
+		}
+		if err := closeProviders(l.closers); err != nil && l.closeErr == nil {
+			l.closeErr = err
+		}
+
+		// Release references so subsequent Close calls are cheap and don't attempt to close again.
+		l.closers = nil
+	})
+	return l.closeErr
 }
 
 // Sync is retained for backward compatibility – it simply forwards to zap.Sync().
-func (l *Logger) Sync() error { return l.zapLogger.Sync() }
+func (l *Logger) Sync() error {
+	if l.zapLogger == nil {
+		return nil
+	}
+	return ignoreSyncError(l.zapLogger.Sync())
+}
 
 // Debug logs at Debug level.
 func (l *Logger) Debug(msg string, fields ...Field) {
@@ -575,4 +601,20 @@ func closeProviders(provs []provider) error {
 		}
 	}
 	return first
+}
+
+func ignoreSyncError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, syscall.ENOTTY) || errors.Is(err, syscall.EINVAL) {
+		return nil
+	}
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		if ignoreSyncError(pathErr.Err) == nil {
+			return nil
+		}
+	}
+	return err
 }
